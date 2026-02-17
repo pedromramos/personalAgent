@@ -1,0 +1,93 @@
+services:
+  # --- SERVIDOR VAULT ---
+  vault:
+    image: hashicorp/vault:latest
+    container_name: vault
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./vault/config:/vault/config
+      - ./vault/data:/vault/file
+    cap_add:
+      - IPC_LOCK
+    entrypoint: vault server -config=/vault/config/vault.hcl
+    restart: always
+    healthcheck:
+      # Se o status for 0 (ok) ou 2 (sealed), o Vault está vivo.
+      test: ["CMD-SHELL", "vault status -address=http://127.0.0.1:8200 > /dev/null 2>&1 || [ $$? -eq 2 ]"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - personal-net
+
+  # --- PROVISIONAMENTO ---
+  vault-init:
+    image: hashicorp/vault:latest
+    container_name: vault-init
+    depends_on:
+      vault:
+        condition: service_healthy
+    volumes:
+      - ./vault/data:/vault/file
+    networks:
+      - personal-net
+    environment:
+      - VAULT_ADDR=http://vault:8200
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "🔍 Verificando consistência do Vault..."
+        
+        # Checa se o Vault já tem dados internamente
+        VAULT_READY=$$(vault status -format=json 2>/dev/null | grep '"initialized": true' || true)
+
+        if [ -z "$$VAULT_READY" ]; then
+          if [ ! -s /vault/file/keys.txt ]; then
+            echo "📦 Vault virgem detectado. Inicializando..."
+            vault operator init -key-shares=1 -key-threshold=1 > /vault/file/keys.txt
+          fi
+        else
+          if [ ! -s /vault/file/keys.txt ]; then
+            echo "❌ ERRO CRÍTICO: Vault já inicializado no storage, mas keys.txt sumiu!"
+            echo "Solução: Limpe a pasta ./vault/data/* e suba novamente."
+            exit 1
+          fi
+          echo "✅ Vault inicializado e chaves presentes."
+        fi
+
+        # Unseal e Login
+        UNSEAL_KEY=$$(grep "Unseal Key 1:" /vault/file/keys.txt | cut -d' ' -f4)
+        ROOT_TOKEN=$$(grep "Initial Root Token:" /vault/file/keys.txt | cut -d' ' -f4)
+        
+        echo "🔓 Abrindo cofre..."
+        vault operator unseal "$$UNSEAL_KEY"
+        vault login "$$ROOT_TOKEN"
+        
+        echo "⚙️ Configurando Pedrin..."
+        vault auth enable userpass || true
+        vault write auth/userpass/users/pedrin password="123" policies="default" || true
+        
+        echo "🏁 SETUP CONCLUÍDO!"
+
+  # --- PERSONAL AGENT ---
+  app:
+    build: 
+      context: ./py-bck
+    container_name: personal_agent
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+    environment:
+      - VAULT_ADDR=http://vault:8200
+    ports:
+      - "8000:8000"
+    networks:
+      - personal-net
+
+networks:
+  personal-net:
+    driver: bridge
